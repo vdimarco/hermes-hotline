@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node call-server.mjs",
     "call": "node call.mjs",
-    "test": "node test/call.test.mjs"
+    "setup": "node setup.mjs",
+    "doctor": "node setup.mjs --check",
+    "test": "node test/call.test.mjs && node test/onboarding.test.mjs"
   },
   "dependencies": {
     "ws": "^8.18.3"

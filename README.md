@@ -8,58 +8,63 @@ Talk to Hermes, and through Hermes to Claude Code, Codex and your other agents, 
 
 | File | What it does |
 | --- | --- |
+| `setup.mjs`, `onboarding.mjs` | `npm run setup` sets everything up. `npm run doctor` checks it |
 | `call.mjs` | Rings your phone |
 | `call-server.mjs` | Connects the call to Hermes. Runs on the computer that runs Hermes |
-| `hotline.mjs` | Shared code: settings, Twilio signatures, call tokens, the Hermes stream |
-| `.env.example` | The settings. Copy it to `.env` |
+| `hotline.mjs` | Shared code: settings, Twilio requests and signatures, call tokens, the Hermes stream |
+| `.env.example` | The settings that setup fills in |
 | `hermes-skill/watch-call/` | A Hermes skill, so Hermes calls you when you ask |
-| `test/call.test.mjs` | The tests: `npm test` |
+| `test/` | The tests: `npm test` |
 
 ## Set up
 
-You need a Twilio account with a phone number that can make calls, and a Hermes gateway on a computer that stays on. Use Node 22.
+Do steps 1 to 3 once. Then setup does the rest on the computer that runs Hermes. That computer must stay on and awake.
 
 ### 1. Answer calls on the watch
 
 1. In the Google Health app, set up calls for the Sense 2. The phone pairs with the watch a second time, for calls.
 2. Call your phone from another phone. Answer on the watch to make sure that you hear the caller.
 
-### 2. Turn on the Hermes API server
+### 2. Prepare Twilio
 
-1. Run `openssl rand -hex 32` and keep the result.
-2. Add these lines to `~/.hermes/.env`:
+1. Make an account at [twilio.com](https://www.twilio.com) and upgrade it from the trial. A trial call waits for a key press, and the watch has no keypad.
+2. In the Twilio Console, under Voice > Settings, accept the Predictive and Generative AI/ML Features Addendum. Without it, calls cannot reach Hermes.
 
-   ```sh
-   API_SERVER_ENABLED=true
-   API_SERVER_KEY=the-result-from-step-1
-   ```
+Setup can buy the phone number that calls you, or use a number that you have.
 
-3. Run `hermes gateway restart`. Hermes refuses a key shorter than 16 characters.
+### 3. Install Tailscale
 
-### 3. Start the call server
+Install [Tailscale](https://tailscale.com/download) on the computer that runs Hermes, and sign in. Setup uses Tailscale Funnel to give the call server a public HTTPS address. If you use another tunnel, setup asks for its address.
 
-Do these steps on the computer that runs Hermes.
+### 4. Run setup
 
-1. Clone this repository to `~/hermes-hotline` and run `npm ci` in it.
-2. Copy `.env.example` to `.env` and fill it in. `HERMES_API_KEY` is the key from step 2.
-3. Give the call server a public HTTPS address. With Tailscale, run `tailscale funnel --bg 8650`. Put the address it shows in `CALL_PUBLIC_URL`.
-4. Run `npm start`. Keep it running, for example as a service.
+On the computer that runs Hermes, with Node 22:
 
-### 4. Test a call
+```sh
+git clone https://github.com/vdimarco/hermes-hotline ~/hermes-hotline
+cd ~/hermes-hotline
+npm ci
+npm run setup
+```
 
-1. Run `node call.mjs "This is a test call."`.
-2. The watch rings within a few seconds. Answer it.
-3. Say "What are my agents doing?". Hermes answers through the watch.
+Setup asks before each change. It:
 
-If the call does not connect, read the call server's output. Lines start with `call:`. A Twilio trial account calls only numbers that you verified in Twilio.
+- turns on the Hermes API server if it is off, and restarts the gateway
+- checks your Twilio account, and picks or buys the number that calls you
+- makes the call server public with Tailscale Funnel
+- saves the settings in `.env` and installs the Hermes skill
+- installs a service that starts the call server with the computer: launchd on a Mac, systemd on Linux, a scheduled task on Windows
+- places a test call to your phone
 
-### 5. Let Hermes call you
+To change a setting later, run setup again and press Enter to keep the other values.
 
-1. Copy `hermes-skill/watch-call` to `~/.hermes/skills/watch-call`.
-2. If you cloned the repository somewhere other than `~/hermes-hotline`, change the path in the skill's `SKILL.md`.
-3. Tell Hermes "call me" in Telegram. On Android, you can say it from the watch: reply by voice to any Hermes message.
+### 5. Check it
 
-To have an agent call you when it waits for you, run a line like this next to it ([herdr](https://herdr.dev) shown):
+`npm run doctor` checks each part and tells you how to fix what fails. It changes nothing.
+
+### Let an agent call you
+
+Run a line like this next to an agent, so it calls you when it waits for you ([herdr](https://herdr.dev) shown):
 
 ```sh
 herdr agent wait codex --until blocked && node ~/hermes-hotline/call.mjs "Codex is waiting for your answer."
@@ -67,6 +72,7 @@ herdr agent wait codex --until blocked && node ~/hermes-hotline/call.mjs "Codex 
 
 ## Use
 
+- Tell Hermes "call me". On Android, you can say it from the watch: reply by voice to any Hermes message in Telegram.
 - Save the Twilio number as a contact named Hermes. Then the watch shows who is calling.
 - Talk normally. To stop a long answer, start to speak. Hermes stops and listens.
 - Hang up when you are done. If Hermes is in the middle of a step, it finishes. Ask about the result on the next call.
@@ -96,4 +102,6 @@ The call server listens on 127.0.0.1 and is reached only through your tunnel. Th
 
 ## Develop
 
-Run `npm ci`, then `npm test`. The tests place a call against a stand-in Twilio API and open call sessions the way Twilio does, against a stand-in Hermes API server. Forged signatures, forged or reused call tokens and messages before setup must never reach Hermes.
+Run `npm ci`, then `npm test`. The call tests place a call against a stand-in Twilio API and open call sessions the way Twilio does, against a stand-in Hermes API server. Forged signatures, forged or reused call tokens and messages before setup must never reach Hermes. The setup tests run setup and doctor on a pretend Linux, Mac and Windows computer.
+
+Setup has run from start to finish on Linux. The Mac and Windows service steps have tests, but have not run on a real Mac or Windows computer yet.
