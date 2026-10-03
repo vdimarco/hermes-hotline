@@ -1,0 +1,18 @@
+{
+  "name": "hermes-hotline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Talk to Hermes and your coding agents from a Fitbit Sense 2: Hermes calls your phone, you answer on the watch",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node call-server.mjs",
+    "call": "node call.mjs",
+    "test": "node test/call.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

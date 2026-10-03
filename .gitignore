@@ -1,0 +1,6 @@
+node_modules
+.DS_Store
+
+# Settings with Twilio and Hermes secrets
+.env*
+!.env.example
