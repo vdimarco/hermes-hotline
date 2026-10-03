@@ -16,14 +16,37 @@ export const VOICE_INSTRUCTIONS = [
   "Before a step that takes more than a few seconds, say in one short sentence what you are starting.",
 ].join(" ");
 
-// Reads KEY=value lines from .env. A value already in the environment wins.
+// Reads KEY=value lines, with or without "export". Comments, blank lines and lower-case names are skipped.
+export function parseEnv(text) {
+  const out = {};
+  for (const line of String(text).split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (m) out[m[1]] = m[2].replace(/^(['"])(.*)\1$/, "$2");
+  }
+  return out;
+}
+
+// Sets KEY=value lines in env-file text. Changes lines in place, adds new ones at the end, keeps the rest.
+export function upsertEnv(text, updates) {
+  const lines = String(text).split(/\r?\n/);
+  while (lines.length && lines.at(-1) === "") lines.pop();
+  const left = new Map(Object.entries(updates).filter(([, v]) => v !== undefined));
+  const out = lines.map((line) => {
+    const m = line.match(/^(\s*(?:export\s+)?)([A-Z][A-Z0-9_]*)\s*=/);
+    if (!m || !left.has(m[2])) return line;
+    const value = left.get(m[2]);
+    left.delete(m[2]);
+    return `${m[1]}${m[2]}=${value}`;
+  });
+  for (const [k, v] of left) out.push(`${k}=${v}`);
+  return out.join("\n") + "\n";
+}
+
+// Reads .env next to this file. A value already in the environment wins.
 export function loadEnv(file = new URL("./.env", import.meta.url), base = process.env) {
   const env = { ...base };
   if (!existsSync(file)) return env;
-  for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (m && env[m[1]] === undefined) env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, "$2");
-  }
+  for (const [k, v] of Object.entries(parseEnv(readFileSync(file, "utf8")))) if (env[k] === undefined) env[k] = v;
   return env;
 }
 
@@ -63,26 +86,36 @@ export function callTwiml(env, reason, token) {
     "</ConversationRelay></Connect></Response>";
 }
 
+// One request to Twilio's REST API for this account. GET without a form, POST with one.
+// TWILIO_API_BASE changes the API address (default https://api.twilio.com).
+export async function twilioRequest(env, path, { form, post = fetch } = {}) {
+  const base = String(env.TWILIO_API_BASE || "https://api.twilio.com").replace(/\/+$/, "");
+  const r = await post(`${base}/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}${path}`, {
+    method: form ? "POST" : "GET",
+    headers: {
+      Authorization: "Basic " + Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64"),
+      ...(form && { "Content-Type": "application/x-www-form-urlencoded" }),
+    },
+    ...(form && { body: new URLSearchParams(form) }),
+  });
+  const reply = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`Twilio answered ${r.status}: ${reply.message || "no details"}`);
+  return reply;
+}
+
 // Rings OWNER_PHONE_NUMBER from the Twilio number. Returns the Twilio call SID.
 export async function placeCall(env, reason = "", { post = fetch, now = Date.now() } = {}) {
   const gaps = missing(env, CALL_SETTINGS);
   if (gaps.length) throw new Error(`Set ${gaps.join(", ")} in .env`);
   if (!/^https:\/\//.test(env.CALL_PUBLIC_URL)) throw new Error("CALL_PUBLIC_URL must start with https://");
   const why = String(reason).replace(/\s+/g, " ").trim().slice(0, 200);
-  const body = new URLSearchParams({
-    To: env.OWNER_PHONE_NUMBER, From: env.TWILIO_PHONE_NUMBER, Timeout: "30",
-    Twiml: callTwiml(env, why, callToken(env.TWILIO_AUTH_TOKEN, now)),
-  });
-  const r = await post(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Calls.json`, {
-    method: "POST",
-    headers: {
-      Authorization: "Basic " + Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64"),
-      "Content-Type": "application/x-www-form-urlencoded",
+  const reply = await twilioRequest(env, "/Calls.json", {
+    post,
+    form: {
+      To: env.OWNER_PHONE_NUMBER, From: env.TWILIO_PHONE_NUMBER, Timeout: "30",
+      Twiml: callTwiml(env, why, callToken(env.TWILIO_AUTH_TOKEN, now)),
     },
-    body,
   });
-  const reply = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`Twilio answered ${r.status}: ${reply.message || "no details"}`);
   return reply.sid;
 }
 

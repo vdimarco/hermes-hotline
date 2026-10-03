@@ -4,3 +4,4 @@ node_modules
 # Settings with Twilio and Hermes secrets
 .env*
 !.env.example
+logs/
