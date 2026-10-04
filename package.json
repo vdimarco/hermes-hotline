@@ -12,6 +12,8 @@
     "call": "node call.mjs",
     "setup": "node setup.mjs",
     "doctor": "node setup.mjs --check",
+    "watchdog": "node setup.mjs --watchdog",
+    "update": "git pull --ff-only && npm ci && node setup.mjs --service",
     "test": "node test/call.test.mjs && node test/onboarding.test.mjs"
   },
   "dependencies": {

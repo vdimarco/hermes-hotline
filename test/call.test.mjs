@@ -1,9 +1,11 @@
 // The watch call: Twilio signatures, call tokens, placing a call, and a call session against a stand-in Hermes.
 // Usage: npm ci, then npm test
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCallServer } from "../call-server.mjs";
@@ -126,6 +128,35 @@ await test("connections without Twilio's signature are refused", async () => {
   assert.equal(await twilioSocket({ signature: twilioSignature(TOKEN, "https://watch.example.ts.net/relay") }).opened, 403, "https is not the signed scheme");
   assert.equal(await twilioSocket({ path: "/other", signature: twilioSignature(TOKEN, "wss://watch.example.ts.net/other") }).opened, 403);
   assert.equal(hermesCalls.length, before);
+});
+
+await test("handshakes that break off do not stop the server", async () => {
+  // A refused handshake whose socket fails: Node gives the raw socket to the upgrade handler with no error listener.
+  const socket = Object.assign(new EventEmitter(), { end() {}, destroy() {}, write: () => true });
+  server.emit("upgrade", { url: "/relay", headers: {} }, socket, Buffer.alloc(0));
+  socket.emit("error", new Error("read ECONNRESET"));
+  // The same from a real client: unsigned upgrade requests, each reset at once. Anyone can reach the public address.
+  for (let i = 0; i < 100; i++) {
+    await new Promise((resolve) => {
+      const s = connect(server.address().port, "127.0.0.1", () => {
+        s.write("GET /relay HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        setImmediate(() => { s.resetAndDestroy(); resolve(); });
+      });
+      s.on("error", resolve);
+    });
+  }
+  assert.equal((await fetch(`http://127.0.0.1:${server.address().port}/health`)).status, 200);
+});
+
+await test("a message over the size limit ends that call, and the server keeps running", async () => {
+  const call = twilioSocket();
+  assert.equal(await call.opened, true);
+  call.ws.send("x".repeat(70 * 1024));
+  assert.equal(await call.closed, 1009);
+  assert.ok(logs.some((line) => line.includes("Max payload size exceeded")));
+  const next = twilioSocket();
+  assert.equal(await next.opened, true, "the next call still connects");
+  next.ws.close();
 });
 
 await test("a session without a valid one-time call token is ended", async () => {

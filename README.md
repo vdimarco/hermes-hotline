@@ -8,7 +8,7 @@ Talk to Hermes, and through Hermes to Claude Code, Codex and your other agents, 
 
 | File | What it does |
 | --- | --- |
-| `setup.mjs`, `onboarding.mjs` | `npm run setup` sets everything up. `npm run doctor` checks it |
+| `setup.mjs`, `onboarding.mjs` | `npm run setup` sets everything up. `npm run doctor` checks it. `npm run update` updates it. The watchdog keeps it running |
 | `call.mjs` | Rings your phone |
 | `call-server.mjs` | Connects the call to Hermes. Runs on the computer that runs Hermes |
 | `hotline.mjs` | Shared code: settings, Twilio requests and signatures, call tokens, the Hermes stream |
@@ -53,7 +53,7 @@ Setup asks before each change. It:
 - checks your Twilio account, and picks or buys the number that calls you
 - makes the call server public with Tailscale Funnel
 - saves the settings in `.env` and installs the Hermes skill
-- installs a service that starts the call server with the computer: launchd on a Mac, systemd on Linux, a scheduled task on Windows
+- installs a service that starts the call server with the computer, and a watchdog: launchd on a Mac, systemd on Linux, scheduled tasks on Windows
 - places a test call to your phone
 
 To change a setting later, run setup again and press Enter to keep the other values.
@@ -61,6 +61,32 @@ To change a setting later, run setup again and press Enter to keep the other val
 ### 5. Check it
 
 `npm run doctor` checks each part and tells you how to fix what fails. It changes nothing.
+
+## Always on
+
+Setup makes the call server hard to stop:
+
+- The service manager starts the call server with the computer. When the process stops for any reason, such as a crash or `kill -9`, the service manager starts it again within seconds. On Linux, systemd never stops trying.
+- A watchdog runs every 5 minutes. If the call server runs but does not answer, the watchdog restarts it. Then it runs the doctor's checks.
+- When a check fails on two runs in a row, the watchdog sends you a Telegram message through Hermes's bot. When the problem is gone, it sends one more. It uses `TELEGRAM_BOT_TOKEN` and `TELEGRAM_HOME_CHANNEL` from Hermes's `.env`.
+
+On Linux, run this once too. Then the call server starts at boot before you log in, and keeps running after you log out:
+
+```sh
+sudo loginctl enable-linger $USER
+```
+
+The calls need Hermes too. If you start the Hermes gateway by hand, run `hermes gateway install` once. It installs a service that restarts the gateway.
+
+| To | Run |
+| --- | --- |
+| Update to the newest version | `npm run update` |
+| Check every part | `npm run doctor` |
+| Read the logs on Linux | `journalctl --user -u hermes-hotline -u hermes-hotline-watchdog -f` |
+| Stop it on purpose on Linux | `systemctl --user stop hermes-hotline-watchdog.timer hermes-hotline` |
+| Start it again on Linux | `systemctl --user start hermes-hotline hermes-hotline-watchdog.timer` |
+
+On a Mac and on Windows, the logs are in `logs/`. To watch the logs in a [herdr](https://herdr.dev) pane, run the log command there. Keep the call server itself under the service manager, because the service manager restarts it when it stops.
 
 ### Let an agent call you
 
@@ -72,7 +98,7 @@ herdr agent wait codex --until blocked && node ~/hermes-hotline/call.mjs "Codex 
 
 ## Use
 
-- Tell Hermes "call me". On Android, you can say it from the watch: reply by voice to any Hermes message in Telegram.
+- Tell Hermes "call me". On Android, you can send it from the watch. In the Google Health app, tap Connections, your Sense 2, Notifications, Quick replies, then Telegram, and change one reply to "Call me". Then pick that reply on any Hermes message. Fitbit's voice replies have a known transcription bug on the Sense 2, but a quick reply is fixed text.
 - Save the Twilio number as a contact named Hermes. Then the watch shows who is calling.
 - Talk normally. To stop a long answer, start to speak. Hermes stops and listens.
 - Hang up when you are done. If Hermes is in the middle of a step, it finishes. Ask about the result on the next call.
@@ -102,6 +128,6 @@ The call server listens on 127.0.0.1 and is reached only through your tunnel. Th
 
 ## Develop
 
-Run `npm ci`, then `npm test`. The call tests place a call against a stand-in Twilio API and open call sessions the way Twilio does, against a stand-in Hermes API server. Forged signatures, forged or reused call tokens and messages before setup must never reach Hermes. The setup tests run setup and doctor on a pretend Linux, Mac and Windows computer.
+Run `npm ci`, then `npm test`. The call tests place a call against a stand-in Twilio API and open call sessions the way Twilio does, against a stand-in Hermes API server. Forged signatures, forged or reused call tokens and messages before setup must never reach Hermes. A client that resets its connection, or sends a message over the size limit, must not stop the server. The setup tests run setup, doctor, the watchdog and update on a pretend Linux, Mac and Windows computer.
 
-Setup has run from start to finish on Linux. The Mac and Windows service steps have tests, but have not run on a real Mac or Windows computer yet.
+Setup has run from start to finish on Linux. The watchdog has run against a real call server, with a stand-in for systemd: it found a frozen server and started a new one. The Mac and Windows service steps have tests, but have not run on a real Mac or Windows computer yet.

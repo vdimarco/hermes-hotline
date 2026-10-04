@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { parseEnv, upsertEnv } from "../hotline.mjs";
 import {
-  SetupError, hermesHome, runChecks, runSetup, servicePlan, skillText, tailscale,
+  SetupError, hermesHome, refreshService, runChecks, runSetup, runWatchdog, servicePlan, skillText, tailscale, telegramChat,
 } from "../onboarding.mjs";
 
 const results = [];
@@ -16,19 +16,29 @@ const json = (body, status = 200) => new Response(JSON.stringify(body), { status
 
 // A pretend computer. `world` holds what the stand-in services know and do.
 function fakeSys({ platform = "linux", files = {}, paths = [], which = {}, world = {}, home = "/home/me" } = {}) {
-  const fs = new Map(Object.entries(files)), modes = new Map(), dirs = new Set(paths), commands = [], requests = [];
+  const fs = new Map(Object.entries(files)), modes = new Map(), dirs = new Set(paths), commands = [], requests = [], telegram = [];
   const w = { hermesUp: true, hermesKey: null, account: { status: "active", type: "Full", friendly_name: "Desk" },
-    numbers: ["+15550001111"], available: ["+14155550123"], verified: true, serverUp: true, publicUp: true, ...world };
+    numbers: ["+15550001111"], available: ["+14155550123"], verified: true, serverUp: true, publicUp: true,
+    enabled: true, timerActive: true, linger: true, telegramUp: true, ...world };
   const run = async (cmd, args) => {
     const line = [cmd, ...args].join(" ");
     commands.push(line);
     if (w.fail?.(line)) return { code: 1, stdout: "", stderr: "it broke" };
     if (/tailscale status --json$/i.test(line)) return w.tailscale ? { code: 0, stdout: JSON.stringify(w.tailscale) } : { code: 1, stdout: "" };
     if (line.endsWith("gateway restart")) w.hermesUp = true;
+    if (line === "systemctl --user restart hermes-hotline.service") w.serverUp = true;
+    if (line.includes(" is-enabled ")) return w.enabled ? { code: 0, stdout: "enabled\n" } : { code: 1, stdout: "disabled\n" };
+    if (line.includes(" is-active ")) return w.timerActive ? { code: 0, stdout: "active\n" } : { code: 3, stdout: "inactive\n" };
+    if (line.includes("--property=Linger")) return { code: 0, stdout: `Linger=${w.linger ? "yes" : "no"}\n` };
     return { code: 0, stdout: "", stderr: "" };
   };
   const fetch = async (url, options = {}) => {
-    requests.push({ url, ...options, form: options.body ? Object.fromEntries(new URLSearchParams(options.body)) : null });
+    requests.push({ url, ...options, form: typeof options.body === "string" ? null : options.body ? Object.fromEntries(new URLSearchParams(options.body)) : null });
+    if (url.startsWith("https://api.telegram.org/")) {
+      if (!w.telegramUp) throw new Error("getaddrinfo ENOTFOUND api.telegram.org");
+      telegram.push({ url, ...JSON.parse(options.body) });
+      return json({ ok: true });
+    }
     if (url.startsWith("http://127.0.0.1:8642/")) {
       if (!w.hermesUp) throw new Error("connect ECONNREFUSED");
       if (url.endsWith("/health")) return json({ status: "ok", platform: "hermes-agent" });
@@ -54,7 +64,7 @@ function fakeSys({ platform = "linux", files = {}, paths = [], which = {}, world
   };
   return {
     platform, home, repoDir: REPO, nodePath: "/usr/bin/node", env: {}, uid: 501, user: "me",
-    files: fs, modes, commands, requests, world: w,
+    files: fs, modes, commands, requests, telegram, world: w,
     which: (cmd) => which[cmd] ?? null,
     exists: (p) => fs.has(p) || dirs.has(p),
     read: (p) => fs.get(p) ?? null,
@@ -115,21 +125,42 @@ await test("Tailscale counts only when it runs and has a name", async () => {
   assert.equal((await tailscale(mac)).bin, "/Applications/Tailscale.app/Contents/MacOS/Tailscale", "the Mac app's own CLI");
 });
 
-await test("each system gets a service that restarts the call server", () => {
+await test("each system gets a service that restarts the call server, and a watchdog", () => {
+  const line = (c) => [c.cmd, ...c.args].join(" ");
   const linux = servicePlan(fakeSys());
   assert.match(linux.files[0].path, /\.config\/systemd\/user\/hermes-hotline\.service$/);
   assert.match(linux.files[0].text, /ExecStart="\/usr\/bin\/node" "\/home\/me\/hermes-hotline\/call-server\.mjs"\nWorkingDirectory=\/home\/me\/hermes-hotline\nRestart=always/);
-  assert.deepEqual(linux.commands.map((c) => [c.cmd, ...c.args].join(" ")), [
-    "systemctl --user daemon-reload", "systemctl --user enable hermes-hotline.service", "systemctl --user restart hermes-hotline.service", "loginctl enable-linger me"]);
+  assert.match(linux.files[0].text, /\[Unit\][^[]*\nStartLimitIntervalSec=0\n/, "systemd never stops restarting it");
+  assert.match(linux.files[1].path, /\.config\/systemd\/user\/hermes-hotline-watchdog\.service$/);
+  assert.match(linux.files[1].text, /Type=oneshot\nExecStart="\/usr\/bin\/node" "\/home\/me\/hermes-hotline\/setup\.mjs" --watchdog\n/);
+  assert.match(linux.files[2].path, /hermes-hotline-watchdog\.timer$/);
+  assert.match(linux.files[2].text, /OnUnitActiveSec=5min\n[^]*WantedBy=timers\.target/);
+  assert.deepEqual(linux.commands.map(line), [
+    "systemctl --user daemon-reload", "systemctl --user enable hermes-hotline.service", "systemctl --user restart hermes-hotline.service",
+    "systemctl --user enable --now hermes-hotline-watchdog.timer", "loginctl enable-linger me"]);
+  assert.deepEqual(linux.restart.map(line), ["systemctl --user restart hermes-hotline.service"]);
+  assert.deepEqual(linux.checks.map(line), [
+    "systemctl --user is-enabled hermes-hotline.service", "systemctl --user is-active hermes-hotline-watchdog.timer", "loginctl show-user me --property=Linger"]);
+
   const mac = servicePlan(fakeSys({ platform: "darwin", home: "/Users/me" }));
   assert.equal(mac.files[0].path, "/Users/me/Library/LaunchAgents/com.hermes-hotline.call-server.plist");
   assert.match(mac.files[0].text, /<array><string>\/usr\/bin\/node<\/string><string>\/home\/me\/hermes-hotline\/call-server\.mjs<\/string><\/array>/);
   assert.match(mac.files[0].text, /<key>KeepAlive<\/key><true\/>/);
-  assert.deepEqual(mac.commands.map((c) => [c.cmd, ...c.args].join(" ")), [
-    "launchctl bootout gui/501/com.hermes-hotline.call-server", `launchctl bootstrap gui/501 ${mac.files[0].path}`]);
+  assert.equal(mac.files[1].path, "/Users/me/Library/LaunchAgents/com.hermes-hotline.watchdog.plist");
+  assert.match(mac.files[1].text, /<string>\/home\/me\/hermes-hotline\/setup\.mjs<\/string><string>--watchdog<\/string><\/array>/);
+  assert.match(mac.files[1].text, /<key>StartInterval<\/key><integer>300<\/integer>/);
+  assert.doesNotMatch(mac.files[1].text, /KeepAlive/, "the watchdog runs and ends");
+  assert.deepEqual(mac.commands.map(line), [
+    "launchctl bootout gui/501/com.hermes-hotline.call-server", `launchctl bootstrap gui/501 ${mac.files[0].path}`,
+    "launchctl bootout gui/501/com.hermes-hotline.watchdog", `launchctl bootstrap gui/501 ${mac.files[1].path}`]);
+  assert.deepEqual(mac.restart.map(line), ["launchctl kickstart -k gui/501/com.hermes-hotline.call-server"]);
+
   const win = servicePlan(fakeSys({ platform: "win32" }));
-  assert.match(win.files[0].text, /^@echo off\r\ncd \/d ".*hermes-hotline"\r\n"\/usr\/bin\/node" ".*call-server\.mjs" >> ".*call-server\.log" 2>&1\r\n$/);
+  assert.match(win.files[0].text, /^@echo off\r\ncd \/d ".*hermes-hotline"\r\n:start\r\n"\/usr\/bin\/node" ".*call-server\.mjs" >> ".*call-server\.log" 2>&1\r\nping -n 6 127\.0\.0\.1 >nul\r\ngoto start\r\n$/);
+  assert.match(win.files[1].text, /"\/usr\/bin\/node" ".*setup\.mjs" --watchdog >> ".*watchdog\.log" 2>&1\r\n$/);
   assert.equal(win.commands[0].args.join(" "), `/Create /TN Hermes Hotline /TR "${win.files[0].path}" /SC ONLOGON /F`);
+  assert.equal(win.commands[1].args.join(" "), `/Create /TN Hermes Hotline Watchdog /TR "${win.files[1].path}" /SC MINUTE /MO 5 /F`);
+  assert.deepEqual(win.restart.map(line), ["schtasks /End /TN Hermes Hotline", "schtasks /Run /TN Hermes Hotline"]);
   assert.equal(servicePlan(fakeSys({ platform: "freebsd" })), null);
 });
 
@@ -177,9 +208,14 @@ await test("setup on a fresh Linux desktop turns on Hermes's API, saves everythi
   assert.equal(sys.modes.get(`${REPO}/.env`), 0o600);
   assert.match(sys.files.get("/home/me/.hermes/skills/watch-call/SKILL.md"), /node "\/home\/me\/hermes-hotline\/call\.mjs"/);
   assert.ok(sys.files.has("/home/me/.config/systemd/user/hermes-hotline.service"));
+  assert.ok(sys.files.has("/home/me/.config/systemd/user/hermes-hotline-watchdog.service"));
+  assert.ok(sys.files.has("/home/me/.config/systemd/user/hermes-hotline-watchdog.timer"));
   assert.deepEqual(sys.commands.filter((c) => !c.includes("status --json")), [
     "/usr/local/bin/hermes gateway restart", "/usr/bin/tailscale funnel --bg 8650",
-    "systemctl --user daemon-reload", "systemctl --user enable hermes-hotline.service", "systemctl --user restart hermes-hotline.service", "loginctl enable-linger me"]);
+    "systemctl --user daemon-reload", "systemctl --user enable hermes-hotline.service", "systemctl --user restart hermes-hotline.service",
+    "systemctl --user enable --now hermes-hotline-watchdog.timer", "loginctl enable-linger me"]);
+  assert.match(io.text(), /a watchdog that checks the call server every 5 minutes/);
+  assert.match(io.text(), /Hermes's \.env has no TELEGRAM_BOT_TOKEN/, "says where watchdog problems go");
   const call = sys.requests.find((r) => r.url.endsWith("/Calls.json"));
   assert.equal(call.form.To, "+15552223333");
   assert.equal(call.form.From, "+15550001111");
@@ -267,7 +303,18 @@ await test("doctor says what works and what to fix", async () => {
   const files = { [`${REPO}/.env`]: settings, "/home/me/.hermes/skills/watch-call/SKILL.md": "skill" };
   let io = scriptedIo([]), sys = fakeSys({ files, world: { hermesKey: "k".repeat(32) } });
   assert.equal(await runChecks({ io, sys }), true);
-  assert.equal(io.said.filter((l) => l.startsWith("✓")).length, 7);
+  assert.equal(io.said.filter((l) => l.startsWith("✓")).length, 8);
+  assert.ok(io.said.includes("✓ Always on"));
+
+  io = scriptedIo([]);
+  assert.equal(await runChecks({ io, sys: fakeSys({ files, world: { hermesKey: "k".repeat(32), linger: false, timerActive: false } }) }), false);
+  assert.match(io.text(), /✗ Always on: the watchdog does not run\. Run: npm run setup; the call server stops when you log out, and waits for your login after a reboot\. Run once: sudo loginctl enable-linger me/);
+  io = scriptedIo([]);
+  assert.equal(await runChecks({ io, sys: fakeSys({ files, world: { hermesKey: "k".repeat(32), enabled: false } }) }), false);
+  assert.match(io.text(), /✗ Always on: the call server does not start with the computer\. Run: npm run setup\n/);
+  io = scriptedIo([]);
+  assert.equal(await runChecks({ io, sys: fakeSys({ platform: "freebsd", files, world: { hermesKey: "k".repeat(32) } }) }), false);
+  assert.match(io.text(), /✗ Always on: setup cannot install a service on this system/);
 
   io = scriptedIo([]);
   sys = fakeSys({ files, world: { hermesKey: "k".repeat(32), serverUp: false, account: { status: "active", type: "Trial", friendly_name: "T" } } });
@@ -285,6 +332,103 @@ await test("doctor says what works and what to fix", async () => {
   assert.match(io.text(), /✗ Settings: TWILIO_ACCOUNT_SID, .* missing from \.env/);
   assert.match(io.text(), /✗ Hermes API server: no answer/);
   assert.match(io.text(), /✗ Hermes skill: not installed/);
+});
+
+const installed = (extra = {}) => ({
+  ...repoFiles(),
+  [`${REPO}/.env`]: upsertEnv(repoFile(".env.example"), {
+    TWILIO_ACCOUNT_SID: SID, TWILIO_AUTH_TOKEN: TOKEN, TWILIO_PHONE_NUMBER: "+15550001111", OWNER_PHONE_NUMBER: "+15552223333",
+    CALL_PUBLIC_URL: "https://desk.tail1234.ts.net", HERMES_API_KEY: "k".repeat(32),
+  }),
+  "/home/me/.hermes/skills/watch-call/SKILL.md": "skill",
+  "/home/me/.config/systemd/user/hermes-hotline.service": "old unit",
+  ...extra,
+});
+
+await test("the watchdog restarts a call server that stops answering", async () => {
+  const sys = fakeSys({ files: installed(), world: { hermesKey: "k".repeat(32), serverUp: false } });
+  const io = scriptedIo([]);
+  assert.equal(await runWatchdog({ io, sys }), true);
+  assert.ok(sys.commands.includes("systemctl --user restart hermes-hotline.service"));
+  assert.match(io.text(), /does not answer at http:\/\/127\.0\.0\.1:8650\/health\. Restarting it\.\nAll checks pass\./);
+  assert.deepEqual(sys.telegram, [], "a restart that works sends nothing");
+
+  const healthy = fakeSys({ files: installed(), world: { hermesKey: "k".repeat(32) } });
+  await runWatchdog({ io: scriptedIo([]), sys: healthy });
+  assert.ok(!healthy.commands.some((c) => c.includes(" restart ")), "no restart while it answers");
+
+  const stuck = fakeSys({ files: installed(), world: { hermesKey: "k".repeat(32), serverUp: false, fail: (l) => l.includes(" restart ") } });
+  const stuckIo = scriptedIo([]);
+  assert.equal(await runWatchdog({ io: stuckIo, sys: stuck }), false);
+  assert.match(stuckIo.text(), /"systemctl --user restart hermes-hotline\.service" failed: it broke\n✗ Call server: no answer/);
+});
+
+await test("the watchdog sends one Telegram message for a lasting problem, and one when it clears", async () => {
+  const hermesEnv = "TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_ALLOWED_USERS=4242, 777\n";
+  const sys = fakeSys({ files: installed({ "/home/me/.hermes/.env": hermesEnv }), world: { hermesKey: "k".repeat(32), publicUp: false } });
+  assert.deepEqual(telegramChat(sys), { token: "123:abc", chat: "4242" }, "the first allowed user when there is no home channel");
+  const run = () => runWatchdog({ io: scriptedIo([]), sys });
+
+  assert.equal(await run(), false);
+  assert.equal(sys.telegram.length, 0, "one bad run can be a network drop");
+  await run();
+  assert.equal(sys.telegram.length, 1);
+  assert.equal(sys.telegram[0].url, "https://api.telegram.org/bot123:abc/sendMessage");
+  assert.equal(sys.telegram[0].chat_id, "4242");
+  assert.match(sys.telegram[0].text, /^Hermes Hotline needs you:\n✗ Public address: no answer at https:\/\/desk\.tail1234\.ts\.net\/health\. Check the tunnel\.$/);
+  await run();
+  assert.equal(sys.telegram.length, 1, "no repeat while the same problem lasts");
+
+  sys.world.publicUp = true;
+  assert.equal(await run(), true);
+  assert.equal(sys.telegram.length, 1);
+  await run();
+  assert.deepEqual(sys.telegram.map((m) => m.text).slice(1), ["Hermes Hotline works again."]);
+  await run();
+  assert.equal(sys.telegram.length, 2);
+
+  sys.files.set("/home/me/.hermes/.env", hermesEnv + "TELEGRAM_HOME_CHANNEL=-1009\n");
+  assert.equal(telegramChat(sys).chat, "-1009", "the home channel comes first");
+});
+
+await test("the watchdog tries again when Telegram cannot take the message", async () => {
+  const sys = fakeSys({ files: installed({ "/home/me/.hermes/.env": "TELEGRAM_BOT_TOKEN=1:a\nTELEGRAM_HOME_CHANNEL=55\n" }),
+    world: { hermesKey: "k".repeat(32), hermesUp: false, telegramUp: false } });
+  const io = scriptedIo([]);
+  await runWatchdog({ io, sys });
+  await runWatchdog({ io, sys });
+  assert.match(io.text(), /Could not send a Telegram message/);
+  sys.world.telegramUp = true;
+  await runWatchdog({ io, sys });
+  assert.equal(sys.telegram.length, 1);
+  assert.match(sys.telegram[0].text, /✗ Hermes API server: no answer at http:\/\/127\.0\.0\.1:8642\. Start Hermes\./);
+
+  const quiet = fakeSys({ files: installed(), world: { hermesKey: "k".repeat(32), publicUp: false } });
+  const quietIo = scriptedIo([]);
+  await runWatchdog({ io: quietIo, sys: quiet });
+  await runWatchdog({ io: quietIo, sys: quiet });
+  assert.match(quietIo.text(), /Could not send a Telegram message\. Hermes's \.env needs TELEGRAM_BOT_TOKEN/, "no Telegram settings: the log says so");
+});
+
+await test("update writes the new service files, restarts the call server and runs the checks", async () => {
+  const sys = fakeSys({ files: installed(), world: { hermesKey: "k".repeat(32) } });
+  const io = scriptedIo([]);
+  assert.equal(await refreshService({ io, sys }), true);
+  assert.match(sys.files.get("/home/me/.config/systemd/user/hermes-hotline.service"), /StartLimitIntervalSec=0/);
+  assert.ok(sys.files.has("/home/me/.config/systemd/user/hermes-hotline-watchdog.timer"));
+  assert.ok(sys.commands.includes("systemctl --user restart hermes-hotline.service"));
+  assert.match(sys.files.get("/home/me/.hermes/skills/watch-call/SKILL.md"), /node "\/home\/me\/hermes-hotline\/call\.mjs"/, "the skill is new too");
+  assert.match(io.text(), /✓ Always on/);
+
+  const noService = installed();
+  delete noService["/home/me/.config/systemd/user/hermes-hotline.service"];
+  const manual = fakeSys({ files: noService, world: { hermesKey: "k".repeat(32) } });
+  const manualIo = scriptedIo([]);
+  await refreshService({ io: manualIo, sys: manual });
+  assert.match(manualIo.text(), /No service is installed/);
+  assert.ok(!manual.commands.includes("systemctl --user daemon-reload"), "update does not install a service nobody asked for");
+
+  await assert.rejects(refreshService({ io: scriptedIo([]), sys: fakeSys({ files: repoFiles() }) }), /missing from \.env\. Run: npm run setup/);
 });
 
 console.log(results.join("\n"));
