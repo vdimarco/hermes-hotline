@@ -18,6 +18,8 @@ export function createCallServer({ env, post = fetch, log = console.log, now = D
 
   // Twilio signs the handshake with the wss:// address from the TwiML, so check that address.
   server.on("upgrade", (req, socket, head) => {
+    // Node hands over the raw socket with no error listener. Without one, a client that resets would stop the server.
+    socket.on("error", () => {});
     const signed = relayBase(env.CALL_PUBLIC_URL) + req.url;
     const signature = String(req.headers["x-twilio-signature"] || "");
     const pathOk = new URL(req.url, "http://local").pathname === "/relay";
@@ -86,6 +88,8 @@ export function createCallServer({ env, post = fetch, log = console.log, now = D
         turn = null;
       } else if (m.type === "error") log("call: Twilio error, " + m.description);
     });
+    // A bad frame or a message over maxPayload: ws closes this call. Without a listener, it would stop the server.
+    ws.on("error", (e) => log("call: connection error, " + e.message));
     // Hanging up does not stop Hermes: the turn finishes and stays in the conversation for the next call.
     ws.on("close", () => clearTimeout(setupTimer));
   }

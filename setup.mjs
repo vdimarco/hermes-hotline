@@ -1,11 +1,12 @@
-// Guided setup: npm run setup. Health check: npm run doctor. Add --yes to accept every default without asking.
+// Guided setup: npm run setup. Add --yes to accept every default without asking.
+// Also: --check (npm run doctor), --watchdog (run by the service manager), --service (npm run update, after git pull).
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, extname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { SetupError, runChecks, runSetup } from "./onboarding.mjs";
+import { SetupError, refreshService, runChecks, runSetup, runWatchdog } from "./onboarding.mjs";
 
 const args = process.argv.slice(2);
 const yes = args.includes("--yes");
@@ -109,6 +110,8 @@ const io = {
 
 try {
   if (args.includes("--check")) process.exit((await runChecks({ io, sys })) ? 0 : 1);
+  if (args.includes("--watchdog")) process.exit((await runWatchdog({ io, sys })) ? 0 : 1);
+  if (args.includes("--service")) process.exit((await refreshService({ io, sys })) ? 0 : 1);
   await runSetup({ io, sys });
 } catch (e) {
   if (!(e instanceof SetupError)) throw e;

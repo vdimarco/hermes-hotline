@@ -6,8 +6,12 @@ import { dirname, join } from "node:path";
 import { CALL_SETTINGS, missing, parseEnv, placeCall, relayUrl, twilioRequest, upsertEnv } from "./hotline.mjs";
 
 export const SERVICE_LABEL = "com.hermes-hotline.call-server";
+export const WATCHDOG_LABEL = "com.hermes-hotline.watchdog";
 export const SYSTEMD_UNIT = "hermes-hotline.service";
+export const WATCHDOG_UNIT = "hermes-hotline-watchdog";
 export const WINDOWS_TASK = "Hermes Hotline";
+export const WINDOWS_WATCHDOG_TASK = "Hermes Hotline Watchdog";
+export const WATCHDOG_MINUTES = 5;
 const SKILL_COMMAND = "node ~/hermes-hotline/call.mjs";
 
 export class SetupError extends Error {}
@@ -213,38 +217,54 @@ export function installSkill({ io, sys }, home) {
 
 const xml = (s) => String(s).replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
 
-// The files to write and the commands to run so the call server starts with the computer.
+// What keeps the call server running on each system: the files to write, the commands that install them,
+// the commands that restart the call server, and the checks that the doctor runs.
+// The service manager starts the call server with the computer and again each time it stops.
+// The watchdog runs every few minutes. It restarts a call server that stops answering, and sends a message when a check fails.
 export function servicePlan(sys) {
-  const server = join(sys.repoDir, "call-server.mjs"), logDir = join(sys.repoDir, "logs"), log = join(logDir, "call-server.log");
+  const server = join(sys.repoDir, "call-server.mjs"), setup = join(sys.repoDir, "setup.mjs");
+  const logDir = join(sys.repoDir, "logs"), log = join(logDir, "call-server.log"), watchLog = join(logDir, "watchdog.log");
+  const notInstalled = "Run: npm run setup";
   if (sys.platform === "darwin") {
-    const plist = join(sys.home, "Library", "LaunchAgents", `${SERVICE_LABEL}.plist`);
-    const text = `<?xml version="1.0" encoding="UTF-8"?>
+    const agents = join(sys.home, "Library", "LaunchAgents");
+    const serverPlist = join(agents, `${SERVICE_LABEL}.plist`), watchPlist = join(agents, `${WATCHDOG_LABEL}.plist`);
+    const plist = (label, args, keys, out) => `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${SERVICE_LABEL}</string>
-  <key>ProgramArguments</key><array><string>${xml(sys.nodePath)}</string><string>${xml(server)}</string></array>
+  <key>Label</key><string>${label}</string>
+  <key>ProgramArguments</key><array>${args.map((a) => `<string>${xml(a)}</string>`).join("")}</array>
   <key>WorkingDirectory</key><string>${xml(sys.repoDir)}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${xml(log)}</string>
-  <key>StandardErrorPath</key><string>${xml(log)}</string>
+  ${keys}
+  <key>StandardOutPath</key><string>${xml(out)}</string>
+  <key>StandardErrorPath</key><string>${xml(out)}</string>
 </dict>
 </plist>
 `;
     return {
-      name: "a launchd agent", logs: log, dirs: [logDir], files: [{ path: plist, text }],
-      commands: [
-        { cmd: "launchctl", args: ["bootout", `gui/${sys.uid}/${SERVICE_LABEL}`], optional: true },
-        { cmd: "launchctl", args: ["bootstrap", `gui/${sys.uid}`, plist] },
+      name: "a launchd agent", logs: logDir, dirs: [logDir],
+      files: [
+        { path: serverPlist, text: plist(SERVICE_LABEL, [sys.nodePath, server], "<key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>", log) },
+        { path: watchPlist, text: plist(WATCHDOG_LABEL, [sys.nodePath, setup, "--watchdog"], `<key>StartInterval</key><integer>${WATCHDOG_MINUTES * 60}</integer>`, watchLog) },
+      ],
+      commands: [[SERVICE_LABEL, serverPlist], [WATCHDOG_LABEL, watchPlist]].flatMap(([label, file]) => [
+        { cmd: "launchctl", args: ["bootout", `gui/${sys.uid}/${label}`], optional: true },
+        { cmd: "launchctl", args: ["bootstrap", `gui/${sys.uid}`, file] },
+      ]),
+      restart: [{ cmd: "launchctl", args: ["kickstart", "-k", `gui/${sys.uid}/${SERVICE_LABEL}`] }],
+      checks: [
+        { cmd: "launchctl", args: ["print", `gui/${sys.uid}/${SERVICE_LABEL}`], fail: `the call server does not start with the computer. ${notInstalled}` },
+        { cmd: "launchctl", args: ["print", `gui/${sys.uid}/${WATCHDOG_LABEL}`], fail: `the watchdog does not run. ${notInstalled}` },
       ],
     };
   }
   if (sys.platform === "linux") {
-    const unit = join(sys.home, ".config", "systemd", "user", SYSTEMD_UNIT);
-    const text = `[Unit]
+    const dir = join(sys.home, ".config", "systemd", "user");
+    const unit = `[Unit]
 Description=Hermes Hotline call server
 After=network-online.target
+# Never stop restarting it, however often it stops.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart="${sys.nodePath}" "${server}"
@@ -255,45 +275,94 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 `;
+    const watchUnit = `[Unit]
+Description=Hermes Hotline watchdog
+
+[Service]
+Type=oneshot
+ExecStart="${sys.nodePath}" "${setup}" --watchdog
+WorkingDirectory=${sys.repoDir}
+`;
+    const timer = `[Unit]
+Description=Run the Hermes Hotline watchdog every ${WATCHDOG_MINUTES} minutes
+
+[Timer]
+OnActiveSec=2min
+OnUnitActiveSec=${WATCHDOG_MINUTES}min
+
+[Install]
+WantedBy=timers.target
+`;
     return {
-      name: "a systemd user service", logs: `journalctl --user -u ${SYSTEMD_UNIT}`, dirs: [], files: [{ path: unit, text }],
+      name: "a systemd user service", logs: `journalctl --user -u ${SYSTEMD_UNIT} -u ${WATCHDOG_UNIT}.service`, dirs: [],
+      files: [
+        { path: join(dir, SYSTEMD_UNIT), text: unit },
+        { path: join(dir, `${WATCHDOG_UNIT}.service`), text: watchUnit },
+        { path: join(dir, `${WATCHDOG_UNIT}.timer`), text: timer },
+      ],
       commands: [
         { cmd: "systemctl", args: ["--user", "daemon-reload"] },
         { cmd: "systemctl", args: ["--user", "enable", SYSTEMD_UNIT] },
         { cmd: "systemctl", args: ["--user", "restart", SYSTEMD_UNIT] },
+        { cmd: "systemctl", args: ["--user", "enable", "--now", `${WATCHDOG_UNIT}.timer`] },
         { cmd: "loginctl", args: ["enable-linger", sys.user], optional: true,
-          note: `To keep the call server running after you log out, run: sudo loginctl enable-linger ${sys.user}` },
+          note: `To keep the call server running when you are logged out, and to start it at boot before you log in, run: sudo loginctl enable-linger ${sys.user}` },
+      ],
+      restart: [{ cmd: "systemctl", args: ["--user", "restart", SYSTEMD_UNIT] }],
+      checks: [
+        { cmd: "systemctl", args: ["--user", "is-enabled", SYSTEMD_UNIT], expect: /^enabled/, fail: `the call server does not start with the computer. ${notInstalled}` },
+        { cmd: "systemctl", args: ["--user", "is-active", `${WATCHDOG_UNIT}.timer`], expect: /^active/, fail: `the watchdog does not run. ${notInstalled}` },
+        { cmd: "loginctl", args: ["show-user", sys.user, "--property=Linger"], expect: /Linger=yes/,
+          fail: `the call server stops when you log out, and waits for your login after a reboot. Run once: sudo loginctl enable-linger ${sys.user}` },
       ],
     };
   }
   if (sys.platform === "win32") {
-    const launcher = join(logDir, "start-call-server.cmd");
-    const text = `@echo off\r\ncd /d "${sys.repoDir}"\r\n"${sys.nodePath}" "${server}" >> "${log}" 2>&1\r\n`;
+    const launcher = join(logDir, "start-call-server.cmd"), watcher = join(logDir, "watchdog.cmd");
+    // The loop starts the call server again 5 seconds after it stops. ping waits, because timeout needs a console.
+    const text = `@echo off\r\ncd /d "${sys.repoDir}"\r\n:start\r\n"${sys.nodePath}" "${server}" >> "${log}" 2>&1\r\nping -n 6 127.0.0.1 >nul\r\ngoto start\r\n`;
+    const watchText = `@echo off\r\ncd /d "${sys.repoDir}"\r\n"${sys.nodePath}" "${setup}" --watchdog >> "${watchLog}" 2>&1\r\n`;
+    const restart = [{ cmd: "schtasks", args: ["/End", "/TN", WINDOWS_TASK], optional: true }, { cmd: "schtasks", args: ["/Run", "/TN", WINDOWS_TASK] }];
     return {
-      name: "a Windows scheduled task", logs: log, dirs: [logDir], files: [{ path: launcher, text }],
+      name: "a Windows scheduled task", logs: logDir, dirs: [logDir],
+      files: [{ path: launcher, text }, { path: watcher, text: watchText }],
       commands: [
         { cmd: "schtasks", args: ["/Create", "/TN", WINDOWS_TASK, "/TR", `"${launcher}"`, "/SC", "ONLOGON", "/F"] },
-        { cmd: "schtasks", args: ["/End", "/TN", WINDOWS_TASK], optional: true },
-        { cmd: "schtasks", args: ["/Run", "/TN", WINDOWS_TASK] },
+        { cmd: "schtasks", args: ["/Create", "/TN", WINDOWS_WATCHDOG_TASK, "/TR", `"${watcher}"`, "/SC", "MINUTE", "/MO", String(WATCHDOG_MINUTES), "/F"] },
+        ...restart,
+      ],
+      restart,
+      checks: [
+        { cmd: "schtasks", args: ["/Query", "/TN", WINDOWS_TASK], fail: `the call server does not start when you log in. ${notInstalled}` },
+        { cmd: "schtasks", args: ["/Query", "/TN", WINDOWS_WATCHDOG_TASK], fail: `the watchdog does not run. ${notInstalled}` },
       ],
     };
   }
   return null;
 }
 
-// Returns true when the call server runs and Twilio can reach it.
-export async function stepService(ctx, settings) {
-  const { io, sys } = ctx;
-  io.say("\n6. Call server");
-  const plan = servicePlan(sys);
-  if (!plan) {
-    io.say("  Setup cannot install a service on this system. Run npm start and keep it running.");
+// The chat where Hermes's Telegram bot reaches you: TELEGRAM_HOME_CHANNEL, else the first allowed user.
+export function telegramChat(sys) {
+  const h = parseEnv(sys.read(join(hermesHome(sys), ".env")) || "");
+  const chat = h.TELEGRAM_HOME_CHANNEL || String(h.TELEGRAM_ALLOWED_USERS || "").split(",")[0].trim();
+  return h.TELEGRAM_BOT_TOKEN && chat ? { token: h.TELEGRAM_BOT_TOKEN, chat } : null;
+}
+
+async function sendTelegram(sys, text) {
+  const to = telegramChat(sys);
+  if (!to) return false;
+  try {
+    const r = await sys.fetch(`https://api.telegram.org/bot${to.token}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: to.chat, text }), signal: AbortSignal.timeout(10000),
+    });
+    return r.ok;
+  } catch {
     return false;
   }
-  if (!(await io.confirm(`Start the call server now, and each time this computer starts? Setup installs ${plan.name}.`, true))) {
-    io.say("  Start the call server with: npm start");
-    return false;
-  }
+}
+
+async function installService({ io, sys }, plan, settings) {
   for (const dir of plan.dirs) sys.mkdir(dir);
   for (const file of plan.files) {
     sys.mkdir(dirname(file.path));
@@ -305,13 +374,32 @@ export async function stepService(ctx, settings) {
     if (!step.optional) throw new SetupError(`"${step.cmd} ${step.args.join(" ")}" failed: ${(r.stderr || r.stdout || "").trim()}`);
     if (step.note) io.say("  ! " + step.note);
   }
-  io.say(`  ✓ Installed ${plan.name}. Logs: ${plan.logs}`);
+  io.say(`  ✓ Installed ${plan.name}, and a watchdog that checks the call server every ${WATCHDOG_MINUTES} minutes. Logs: ${plan.logs}`);
+  io.say(telegramChat(sys)
+    ? "  ✓ When a check fails, the watchdog sends you a Telegram message through Hermes's bot."
+    : "  ! Hermes's .env has no TELEGRAM_BOT_TOKEN and TELEGRAM_HOME_CHANNEL, so the watchdog only writes problems to its log.");
   const local = `http://127.0.0.1:${settings.CALL_PORT}/health`;
   if (!(await healthy(sys, local, 15))) throw new SetupError(`The call server does not answer at ${local}. Read the logs: ${plan.logs}`);
   io.say("  ✓ The call server runs.");
   if (!(await healthy(sys, `${settings.CALL_PUBLIC_URL}/health`, 30)))
     throw new SetupError(`The call server does not answer at ${settings.CALL_PUBLIC_URL}/health. Check the tunnel, then run: npm run doctor`);
   io.say(`  ✓ Twilio can reach the call server at ${relayUrl(settings.CALL_PUBLIC_URL)}.`);
+}
+
+// Returns true when the call server runs and Twilio can reach it.
+export async function stepService(ctx, settings) {
+  const { io, sys } = ctx;
+  io.say("\n6. Call server");
+  const plan = servicePlan(sys);
+  if (!plan) {
+    io.say("  Setup cannot install a service on this system. Run npm start and keep it running.");
+    return false;
+  }
+  if (!(await io.confirm(`Start the call server now, and each time this computer starts? Setup installs ${plan.name} and a watchdog.`, true))) {
+    io.say("  Start the call server with: npm start");
+    return false;
+  }
+  await installService(ctx, plan, settings);
   return true;
 }
 
@@ -343,17 +431,15 @@ export async function runSetup(ctx) {
   io.say('\nDone. Tell Hermes "call me" when you want to talk. If something stops working, run: npm run doctor');
 }
 
-// `npm run doctor`: checks every part and says how to fix what fails. Changes nothing.
-export async function runChecks({ io, sys }) {
+// Checks every part and says how to fix what fails. Changes nothing. Returns [{ name, ok, note }].
+export async function checkAll(sys) {
   const s = parseEnv(sys.read(join(sys.repoDir, ".env")) || "");
-  let allOk = true;
+  const results = [];
   const check = async (name, fn) => {
     try {
-      const note = await fn();
-      io.say(`✓ ${name}${note ? ": " + note : ""}`);
+      results.push({ name, ok: true, note: (await fn()) || "" });
     } catch (e) {
-      allOk = false;
-      io.say(`✗ ${name}: ${e.message}`);
+      results.push({ name, ok: false, note: e.message });
     }
   };
   await check("Settings", () => {
@@ -385,8 +471,71 @@ export async function runChecks({ io, sys }) {
     if (!serverUp) throw new Error("not checked, because the call server does not run");
     if (!(await healthy(sys, `${s.CALL_PUBLIC_URL}/health`))) throw new Error(`no answer at ${s.CALL_PUBLIC_URL}/health. Check the tunnel.`);
   });
+  await check("Always on", async () => {
+    const plan = servicePlan(sys);
+    if (!plan) throw new Error("setup cannot install a service on this system. Keep npm start running.");
+    const problems = [];
+    for (const c of plan.checks) {
+      const r = await sys.run(c.cmd, c.args);
+      if (r.code !== 0 || (c.expect && !c.expect.test(r.stdout))) problems.push(c.fail);
+    }
+    if (problems.length) throw new Error(problems.join("; "));
+  });
   await check("Hermes skill", () => {
     if (!sys.exists(join(hermesHome(sys), "skills", "watch-call", "SKILL.md"))) throw new Error("not installed. Run: npm run setup");
   });
-  return allOk;
+  return results;
+}
+
+// `npm run doctor`
+export async function runChecks({ io, sys }) {
+  const results = await checkAll(sys);
+  for (const r of results) io.say(`${r.ok ? "✓" : "✗"} ${r.name}${r.note ? ": " + r.note : ""}`);
+  return results.every((r) => r.ok);
+}
+
+// `npm run watchdog`: the service manager runs it every few minutes. It restarts a call server that does not answer,
+// then runs the doctor's checks. When the same checks fail on two runs in a row, it sends one Telegram message.
+// When they pass again on two runs in a row, it sends one more. A single bad run, such as a short network drop, sends nothing.
+export async function runWatchdog({ io, sys }) {
+  const s = parseEnv(sys.read(join(sys.repoDir, ".env")) || "");
+  const plan = servicePlan(sys);
+  const local = `http://127.0.0.1:${s.CALL_PORT || "8650"}/health`;
+  if (plan && !(await healthy(sys, local, 3))) {
+    io.say(`The call server does not answer at ${local}. Restarting it.`);
+    for (const step of plan.restart) {
+      const r = await sys.run(step.cmd, step.args);
+      if (r.code !== 0 && !step.optional) io.say(`"${step.cmd} ${step.args.join(" ")}" failed: ${(r.stderr || r.stdout || "").trim()}`);
+    }
+    await healthy(sys, local, 15);
+  }
+  const failed = (await checkAll(sys)).filter((r) => !r.ok);
+  const lines = failed.map((r) => `✗ ${r.name}: ${r.note}`);
+  const stateFile = join(sys.repoDir, "logs", "watchdog.json");
+  let state = {};
+  try { state = JSON.parse(sys.read(stateFile) || "{}"); } catch {}
+  const now = failed.map((r) => r.name).join(", "); // names only: a note can change from run to run
+  if (now === (state.last ?? "") && now !== (state.alerted ?? "")) {
+    if (await sendTelegram(sys, now ? ["Hermes Hotline needs you:", ...lines].join("\n") : "Hermes Hotline works again.")) state.alerted = now;
+    else io.say("Could not send a Telegram message. Hermes's .env needs TELEGRAM_BOT_TOKEN and TELEGRAM_HOME_CHANNEL.");
+  }
+  state.last = now;
+  sys.mkdir(dirname(stateFile));
+  sys.write(stateFile, JSON.stringify(state) + "\n");
+  io.say(now ? lines.join("\n") : "All checks pass.");
+  return !now;
+}
+
+// `npm run update` runs this after git pull and npm ci, so the new code writes the service files and restarts the call server.
+export async function refreshService(ctx) {
+  const { io, sys } = ctx;
+  const s = parseEnv(sys.read(join(sys.repoDir, ".env")) || "");
+  const gaps = missing(s, [...CALL_SETTINGS, "HERMES_API_KEY"]);
+  if (gaps.length) throw new SetupError(`${gaps.join(", ")} missing from .env. Run: npm run setup`);
+  installSkill(ctx, hermesHome(sys));
+  const plan = servicePlan(sys);
+  if (plan && sys.exists(plan.files[0].path)) await installService(ctx, plan, { ...s, CALL_PORT: s.CALL_PORT || "8650" });
+  else io.say("  No service is installed. Stop npm start and start it again to use the new version. Or run: npm run setup");
+  io.say("");
+  return runChecks(ctx);
 }
